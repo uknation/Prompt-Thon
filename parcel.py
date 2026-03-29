@@ -2,44 +2,61 @@ import cv2
 import numpy as np
 import easyocr
 
-# ==============================
-# 1. LOAD IMAGE (COMMON)
-# ==============================
+
+
+# 1. LOAD IMAGE 
+
 image_path = 'enimg.png'
 img = cv2.imread(image_path)
 output = img.copy()
 
 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-# ==============================
-# 2. PREPROCESSING (COMMON)
-# ==============================
+# 2. PREPROCESSING 
 blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
 # Two thresholds for different tasks
 _, binary_walls = cv2.threshold(blurred, 180, 255, cv2.THRESH_BINARY_INV)
 _, binary_windows = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY_INV)
 
-# ==============================
-# 3. SCALE CALIBRATION
-# ==============================
+
+# 3. OCR PRECHECK FOR TEXT REGIONS
+reader = easyocr.Reader(['en'])
+ocr_results = reader.readtext(img)
+ocr_boxes = []
+for (bbox, text, prob) in ocr_results:
+    x, y = tuple(map(int, bbox[0]))
+    x2, y2 = tuple(map(int, bbox[2]))
+    ocr_boxes.append((x, y, x2 - x, y2 - y))
+
+
+def line_overlaps_text(x1, y1, x2, y2, boxes):
+    x_min, x_max = min(x1, x2), max(x1, x2)
+    y_min, y_max = min(y1, y2), max(y1, y2)
+    for bx, by, bw, bh in boxes:
+        if not (x_max < bx or x_min > bx + bw or y_max < by or y_min > by + bh):
+            return True
+    return False
+
+# 4. SCALE CALIBRATION
 pixels_4m = 100
 ppm = pixels_4m / 4  # Pixels per meter
 
-# ==============================
+
 # 4. WALL DETECTION
-# ==============================
 lines = cv2.HoughLinesP(binary_walls, 1, np.pi/180, 
                         threshold=100, minLineLength=50, maxLineGap=10)
 
 if lines is not None:
     for line in lines:
         x1, y1, x2, y2 = line[0]
+        if line_overlaps_text(x1, y1, x2, y2, ocr_boxes):
+            continue
+
         cv2.line(output, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-# ==============================
+
 # 5. ROOM AREA DETECTION
-# ==============================
 contours, _ = cv2.findContours(binary_walls, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
 for cnt in contours:
@@ -53,9 +70,9 @@ for cnt in contours:
     cv2.putText(output, f"{area_m2:.1f} sqm", (x, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 0), 1)
 
-# ==============================
+
 # 6. WINDOW DETECTION
-# ==============================
+
 contours, _ = cv2.findContours(binary_windows, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
 window_count = 0
@@ -74,10 +91,8 @@ for cnt in contours:
         cv2.putText(output, f"W{window_count}", (x, y-5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
-# ==============================
+
 # 7. OCR ROOM NAME DETECTION
-# ==============================
-reader = easyocr.Reader(['en'])
 
 allowed_rooms = [
     "LIVING ROOM", "BEDROOM", "KITCHEN", "BATHROOM",
@@ -85,7 +100,7 @@ allowed_rooms = [
     "STORE ROOM", "BALCONY", "BATH"
 ]
 
-results = reader.readtext(img)
+results = ocr_results
 detected_rooms = []
 
 for (bbox, text, prob) in results:
@@ -104,9 +119,9 @@ for (bbox, text, prob) in results:
                     (top_left[0], top_left[1]-10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
 
-# ==============================
+
 # 8. SUMMARY PANEL
-# ==============================
+
 h, w, _ = output.shape
 bottom_margin = 180
 
@@ -126,11 +141,10 @@ for i, room in enumerate(detected_rooms):
                 (40 + col * 350, start_y + 40 + row * 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 60, 60), 2)
 
-# ==============================
+
 # 9. FINAL OUTPUT
-# ==============================
-print(f"Total Rooms: {len(detected_rooms)}")
-print(f"Total Windows: {window_count}")
+
+
 
 cv2.imshow('Final Combined Output', canvas)
 cv2.imwrite('Final_Output.png', canvas)
