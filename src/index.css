@@ -6,21 +6,24 @@
   color-scheme: dark;
 }
 
-html, body, #root {
+html,
+body,
+#root {
   min-height: 100%;
 }
 
 body {
   margin: 0;
-  font-family: 'Segoe UI', sans-serif;
-  background:
-    radial-gradient(circle at top left, rgba(75, 233, 212, 0.12), transparent 30%),
-    radial-gradient(circle at top right, rgba(216, 255, 82, 0.14), transparent 25%),
-    linear-gradient(180deg, #07101d 0%, #0b1020 55%, #121a2f 100%);
+  font-family: "Trebuchet MS", "Segoe UI", sans-serif;
 }
 
 canvas {
   touch-action: none;
+}
+
+img {
+  display: block;
+  max-width: 100%;
 }
 
 ::-webkit-scrollbar {
@@ -29,6 +32,6 @@ canvas {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #2a3a64;
-  border-radius: 9999px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.35);
 }

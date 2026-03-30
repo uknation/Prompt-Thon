@@ -129,6 +129,12 @@ export default function ParserCanvas({ parsed, layers, planPreview, editableShel
   }
 
   function drawOverlay(ctx, isCustomPlan, height) {
+    const segmentation = parsed.plan?.segmentation;
+
+    if (layers.segmentation && segmentation) {
+      drawSegmentation(ctx, segmentation);
+    }
+
     if (layers.rooms) {
       parsed.rooms.forEach((room) => {
         ctx.fillStyle = isCustomPlan ? 'rgba(75, 233, 212, 0.08)' : room.color;
@@ -166,6 +172,10 @@ export default function ParserCanvas({ parsed, layers, planPreview, editableShel
     ctx.font = '11px Consolas';
     ctx.textAlign = 'left';
     ctx.fillText(isCustomPlan ? 'Drag the shell box to crop and fit the plan' : 'Scale: 1cm = 0.4m', 12, height - 12);
+    if (layers.segmentation && segmentation?.source) {
+      ctx.textAlign = 'right';
+      ctx.fillText(segmentation.source, 668, height - 12);
+    }
   }
 
   function drawCropShell(ctx, shell) {
@@ -189,6 +199,57 @@ export default function ParserCanvas({ parsed, layers, planPreview, editableShel
   }
 
   return <canvas ref={ref} width={680} height={460} className="w-full rounded-3xl border border-white/10 bg-ink" style={{ cursor }} />;
+}
+
+function drawSegmentation(ctx, segmentation) {
+  ctx.save();
+
+  segmentation.walls?.forEach((rect) => {
+    ctx.fillStyle = 'rgba(255, 122, 89, 0.08)';
+    ctx.strokeStyle = 'rgba(255, 122, 89, 0.75)';
+    ctx.lineWidth = 1.5;
+    ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+    ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+  });
+
+  if (segmentation.wallLines?.length) {
+    ctx.strokeStyle = 'rgba(255, 166, 87, 0.85)';
+    ctx.lineWidth = 1.25;
+    ctx.setLineDash([5, 4]);
+    segmentation.wallLines.forEach((line) => {
+      ctx.beginPath();
+      ctx.moveTo(line.x1, line.y1);
+      ctx.lineTo(line.x2, line.y2);
+      ctx.stroke();
+    });
+    ctx.setLineDash([]);
+  }
+
+  segmentation.windows?.forEach((rect) => {
+    ctx.fillStyle = 'rgba(75, 233, 212, 0.18)';
+    ctx.strokeStyle = '#4be9d4';
+    ctx.lineWidth = 1.5;
+    ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+    ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    ctx.fillStyle = '#4be9d4';
+    ctx.font = '10px Segoe UI';
+    ctx.textAlign = 'center';
+    ctx.fillText('W', rect.x + rect.w / 2, rect.y + rect.h / 2 + 3);
+  });
+
+  segmentation.doors?.forEach((rect) => {
+    ctx.fillStyle = 'rgba(216, 255, 82, 0.16)';
+    ctx.strokeStyle = '#d8ff52';
+    ctx.lineWidth = 1.5;
+    ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+    ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    ctx.fillStyle = '#d8ff52';
+    ctx.font = '10px Segoe UI';
+    ctx.textAlign = 'center';
+    ctx.fillText('D', rect.x + rect.w / 2, rect.y + rect.h / 2 + 3);
+  });
+
+  ctx.restore();
 }
 
 function toCanvasPoint(canvas, event) {

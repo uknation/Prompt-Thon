@@ -18,6 +18,15 @@ export default function ParserSection({
   onUpdateShellRect,
 }) {
   const shell = parsed?.plan?.outerWalls?.[0];
+  const activePlan = parsed?.plan || samplePlans[selectedPlan];
+  const segmentation = activePlan?.segmentation;
+  const layerOrder = ['walls', 'rooms', 'openings', 'labels', 'segmentation'];
+  const parserStats = [
+    { label: 'Area', value: activePlan?.planArea ? `${activePlan.planArea} m2` : '-' },
+    { label: 'Rooms', value: parsed?.rooms?.length ?? 0 },
+    { label: 'Openings', value: parsed?.openings?.length ?? 0 },
+    { label: 'Input', value: activePlan?.id === 'CUSTOM' ? 'Upload' : `Plan ${activePlan?.id ?? selectedPlan}` },
+  ];
 
   return (
     <StageCard
@@ -31,9 +40,14 @@ export default function ParserSection({
             Upload Image
             <input type="file" accept="image/*" className="hidden" onChange={onUpload} />
           </label>
-          <button type="button" onClick={onStart} className="inline-flex items-center gap-2 rounded-full border border-aqua/40 bg-aqua/10 px-4 py-2 text-sm font-medium text-aqua hover:bg-aqua/20">
+          <button
+            type="button"
+            onClick={onStart}
+            disabled={isParsing}
+            className="inline-flex items-center gap-2 rounded-full border border-aqua/40 bg-aqua/10 px-4 py-2 text-sm font-medium text-aqua transition hover:bg-aqua/20 disabled:cursor-not-allowed disabled:opacity-50"
+          >
             <ScanLine size={16} />
-            Parse Now
+            {isParsing ? 'Parsing...' : 'Parse Now'}
           </button>
         </>
       )}
@@ -67,10 +81,19 @@ export default function ParserSection({
                 Custom image loaded
               </p>
               <p className="mt-2 text-sm text-fog">
-                The uploaded image now drives a custom shell and room layout based on the uploaded plan proportions, instead of overlaying the sample layout.
+                The uploaded image now drives custom shell reconstruction plus wall, door, and window segmentation overlays when parser detections are available.
               </p>
             </div>
           ) : null}
+
+          <div className="grid grid-cols-2 gap-3">
+            {parserStats.map((item) => (
+              <div key={item.label} className="rounded-2xl border border-white/10 bg-white/5 p-4">
+                <p className="text-xs uppercase tracking-[0.22em] text-fog">{item.label}</p>
+                <p className="mt-2 text-lg font-semibold text-white">{item.value}</p>
+              </div>
+            ))}
+          </div>
 
           <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
             <div className="flex items-center justify-between text-sm text-fog">
@@ -85,6 +108,25 @@ export default function ParserSection({
             </p>
           </div>
 
+          {activePlan?.purpose ? (
+            <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
+              <p className="text-xs uppercase tracking-[0.24em] text-fog">Evaluation purpose</p>
+              <p className="mt-2 text-sm leading-7 text-fog">{activePlan.purpose}</p>
+            </div>
+          ) : null}
+
+          {segmentation ? (
+            <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
+              <p className="text-xs uppercase tracking-[0.24em] text-fog">Detected elements</p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <DetectionChip label="Wall regions" value={segmentation.walls?.length ?? 0} tone="coral" />
+                <DetectionChip label="Wall lines" value={segmentation.wallLines?.length ?? 0} tone="amber" />
+                <DetectionChip label="Windows" value={segmentation.windows?.length ?? 0} tone="aqua" />
+                <DetectionChip label="Doors" value={segmentation.doors?.length ?? 0} tone="lime" />
+              </div>
+            </div>
+          ) : null}
+
           {shell ? (
             <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
               <p className="text-xs uppercase tracking-[0.24em] text-fog">Mouse Edit</p>
@@ -95,14 +137,14 @@ export default function ParserSection({
 
         <div className="space-y-4">
           <div className="flex flex-wrap gap-2">
-            {Object.keys(layers).map((layer) => (
+            {layerOrder.map((layer) => (
               <button
                 key={layer}
                 type="button"
                 onClick={() => onToggleLayer(layer)}
                 className={`rounded-full px-4 py-2 text-sm ${layers[layer] ? 'bg-white text-ink' : 'border border-white/15 bg-white/5 text-fog'}`}
               >
-                {layer}
+                {formatLayerLabel(layer)}
               </button>
             ))}
           </div>
@@ -111,4 +153,23 @@ export default function ParserSection({
       </div>
     </StageCard>
   );
+}
+
+function DetectionChip({ label, value, tone }) {
+  const toneMap = {
+    coral: 'border-coral/20 bg-coral/10 text-coral',
+    amber: 'border-[#ffb36b]/20 bg-[#ffb36b]/10 text-[#ffb36b]',
+    aqua: 'border-aqua/20 bg-aqua/10 text-aqua',
+    lime: 'border-lime/20 bg-lime/10 text-lime',
+  };
+
+  return (
+    <div className={`rounded-full border px-3 py-2 text-xs uppercase tracking-[0.2em] ${toneMap[tone] || 'border-white/10 bg-white/5 text-white'}`}>
+      {label}: {value}
+    </div>
+  );
+}
+
+function formatLayerLabel(layer) {
+  return layer.charAt(0).toUpperCase() + layer.slice(1);
 }

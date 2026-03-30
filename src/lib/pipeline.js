@@ -1,5 +1,6 @@
 import { samplePlans } from '../data/plans';
 import { materials } from '../data/materials';
+import { requestServerPlanAnalysis } from './api';
 
 export const STAGES = [
   { id: 0, label: 'Parser', subtitle: 'Floor-plan intelligence' },
@@ -28,12 +29,45 @@ export function getPlanFromSelection(planId, uploadedPlan) {
   return fallback;
 }
 
-export async function analyzeUploadedPlan(uploadedPlan) {
+export async function analyzeUploadedPlan(uploadedPlan, file) {
   if (!uploadedPlan?.src) return null;
+
+  if (file) {
+    const serverAnalysis = await requestServerPlanAnalysis(file);
+    if (serverAnalysis) {
+      return createCustomPlanFromUpload({ ...uploadedPlan, analysis: serverAnalysis });
+    }
+  }
 
   const image = await loadImage(uploadedPlan.src);
   const analysis = inspectPlanImage(image);
   return createCustomPlanFromUpload({ ...uploadedPlan, analysis });
+}
+
+export function buildLocalPipelineRun(plan, prompt = '') {
+  const parsed = buildParsedModel(plan);
+  const geometry = buildGeometryModel(parsed);
+  const modelStats = buildModelStats(geometry);
+  const materialAnalysis = buildMaterialAnalysis(geometry);
+  const report = buildExplainabilityReport(plan, geometry, materialAnalysis);
+
+  return {
+    plan,
+    parsed,
+    geometry,
+    modelStats,
+    materialAnalysis,
+    report,
+    prompt,
+    reportMeta: {
+      source: 'template',
+      reason: 'local-pipeline',
+      provider: 'Local rules',
+      model: '',
+      configured: false,
+    },
+    executionSource: 'local',
+  };
 }
 
 function createCustomPlanFromUpload(uploadedPlan) {
@@ -60,22 +94,36 @@ function createCustomPlanFromUpload(uploadedPlan) {
   const shellX = Math.round(imageOffsetX + drawWidth * box.x);
   const shellY = Math.round(imageOffsetY + drawHeight * box.y);
   const planArea = Math.max(75, Math.round((uploadedPlan.width * uploadedPlan.height) / 12000));
-  const rooms = buildRoomsFromAnalysis(analysis, {
+  const scale = Number(Math.sqrt(planArea / Math.max(shellWidth * shellHeight, 1)).toFixed(4));
+  const canvasMetrics = {
     shellX,
     shellY,
     shellWidth,
     shellHeight,
+    imageOffsetX,
+    imageOffsetY,
+    drawWidth,
+    drawHeight,
+  };
+  const rooms = buildRoomsFromAnalysis(analysis, {
+    ...canvasMetrics,
   });
+  const segmentation = buildSegmentationFromAnalysis(analysis, canvasMetrics);
+  const wallSegments = buildWallSegmentsFromAnalysis(segmentation, canvasMetrics, scale);
+  const openings = buildOpeningsFromAnalysis(segmentation, canvasMetrics, scale);
 
   return {
     id: 'CUSTOM',
     name: uploadedPlan.name ? `Custom Uploaded Plan - ${uploadedPlan.name}` : 'Custom Uploaded Plan',
     description: 'User-specific geometry is generated from the uploaded floor-plan image bounds instead of reusing the sample layout.',
     preview: uploadedPlan.src,
-    scale: Number(Math.sqrt(planArea / Math.max(shellWidth * shellHeight, 1)).toFixed(4)),
+    scale,
     planArea,
     outerWalls: [{ x: shellX, y: shellY, w: Math.round(shellWidth), h: Math.round(shellHeight) }],
     rooms,
+    wallSegments,
+    openings,
+    segmentation,
   };
 }
 
@@ -91,7 +139,26 @@ function buildRoomsFromAnalysis(analysis, shell) {
     'rgba(180, 120, 255, 0.14)',
     'rgba(255,255,255,0.08)',
   ];
-  const names = ['Living', 'Bedroom 1', 'Kitchen', 'Bedroom 2', 'Bath', 'Utility', 'Entry'];
+  const names = analysis?.roomNames?.length
+    ? analysis.roomNames
+    : ['Living', 'Bedroom 1', 'Kitchen', 'Bedroom 2', 'Bath', 'Utility', 'Entry'];
+
+  if (analysis?.roomBoxes?.length) {
+    const mappedRooms = analysis.roomBoxes
+      .map((roomBox, index) => ({
+        name: names[index] || `Room ${index + 1}`,
+        x: Math.round(shell.imageOffsetX + roomBox.x * shell.drawWidth),
+        y: Math.round(shell.imageOffsetY + roomBox.y * shell.drawHeight),
+        w: Math.round(roomBox.w * shell.drawWidth),
+        h: Math.round(roomBox.h * shell.drawHeight),
+        color: colors[index % colors.length],
+      }))
+      .filter((room) => room.w >= minRoomWidth && room.h >= minRoomHeight);
+
+    if (mappedRooms.length) {
+      return mappedRooms.slice(0, 8);
+    }
+  }
 
   const box = analysis?.box || { x: 0, y: 0, w: 1, h: 1 };
   const verticalCuts = analysis?.verticalCuts?.length
@@ -255,28 +322,29 @@ function buildWallNetwork(plan) {
     { x1: room.x, y1: room.y, x2: room.x + room.w, y2: room.y, type: 'partition', thickness: 0.15 },
     { x1: room.x + room.w, y1: room.y, x2: room.x + room.w, y2: room.y + room.h, type: 'partition', thickness: 0.15 },
     { x1: room.x, y1: room.y + room.h, x2: room.x + room.w, y2: room.y + room.h, type: 'partition', thickness: 0.15 },
-    { x1: room.x, y1: room.y, x2: room.x, y2: room.y + room.h, type: 'partition', thickness: 0.15 },
+      { x1: room.x, y1: room.y, x2: room.x, y2: room.y + room.h, type: 'partition', thickness: 0.15 },
   ]));
 
+  const sourceSegments = plan.wallSegments?.length ? plan.wallSegments : [...shells, ...roomEdges];
   const merged = new Map();
   let id = 1;
 
-  [...shells, ...roomEdges].forEach((segment) => {
+  sourceSegments.forEach((segment) => {
     const normalized = normalizeSegment(segment);
     const key = segmentKey(normalized);
     const existing = merged.get(key);
 
     if (existing) {
       existing.count += 1;
-      existing.type = existing.type === 'load-bearing' || segment.type === 'load-bearing' ? 'load-bearing' : 'partition';
-      existing.thickness = Math.max(existing.thickness, segment.thickness);
+      existing.type = existing.type === 'load-bearing' || normalized.type === 'load-bearing' ? 'load-bearing' : 'partition';
+      existing.thickness = Math.max(existing.thickness, normalized.thickness ?? 0.15);
       return;
     }
 
     merged.set(key, {
       ...normalized,
       id: `W${id++}`,
-      count: 1,
+      count: normalized.count ?? 1,
     });
   });
 
@@ -288,6 +356,29 @@ function buildWallNetwork(plan) {
 }
 
 function buildOpenings(plan, walls) {
+  if (plan.openings?.length) {
+    const explicitOpenings = plan.openings.map((opening, index) => ({
+      id: opening.id || `O${index + 1}`,
+      ...opening,
+    }));
+    const needsDoors = !explicitOpenings.some((opening) => opening.type.includes('door'));
+    const needsWindows = !explicitOpenings.some((opening) => opening.type === 'window');
+
+    if (!needsDoors && !needsWindows) {
+      return explicitOpenings;
+    }
+
+    const fallbackOpenings = buildFallbackOpenings(plan, walls).filter((opening) => (
+      (needsDoors && opening.type.includes('door'))
+      || (needsWindows && opening.type === 'window')
+    ));
+    return [...explicitOpenings, ...fallbackOpenings];
+  }
+
+  return buildFallbackOpenings(plan, walls);
+}
+
+function buildFallbackOpenings(plan, walls) {
   const openings = [];
   let openingId = 1;
   const shell = plan.outerWalls[0];
@@ -423,8 +514,8 @@ function collectJunctions(walls) {
 export function buildModelStats(geometry) {
   const scale = geometry.plan.scale * 8;
   const floorHeight = 3;
-  const shell = geometry.plan.outerWalls[0];
-  const volume = shell ? shell.w * shell.h * scale * scale * floorHeight : 0;
+  const shellArea = geometry.plan.outerWalls.reduce((sum, shell) => sum + shell.w * shell.h, 0);
+  const volume = shellArea * scale * scale * floorHeight;
   const vertexEstimate = geometry.walls.length * 24;
 
   return {
@@ -434,6 +525,274 @@ export function buildModelStats(geometry) {
     footprint: geometry.plan.outerWalls.length > 1 ? 'L-Shape' : 'Rectilinear',
     meshCount: geometry.walls.length,
   };
+}
+
+function buildSegmentationFromAnalysis(analysis, shell) {
+  if (!analysis) return null;
+
+  const wallRegions = (analysis.wallRegions || []).map((rect) => ({
+    ...mapNormalizedRectToCanvas(rect, shell),
+    orientation: rect.orientation || inferRectOrientation(rect),
+  }));
+  const wallLines = (analysis.wallLines || [])
+    .map((line) => mapNormalizedLineToCanvas(line, shell))
+    .map(snapLineToAxis)
+    .filter(Boolean);
+  const windows = (analysis.windowRects || []).map((rect) => ({
+    ...mapNormalizedRectToCanvas(rect, shell),
+    orientation: rect.orientation || inferRectOrientation(rect),
+  }));
+  const doors = (analysis.doorRects || []).map((rect) => ({
+    ...mapNormalizedRectToCanvas(rect, shell),
+    orientation: rect.orientation || inferRectOrientation(rect),
+  }));
+
+  if (!wallRegions.length && !wallLines.length && !windows.length && !doors.length) {
+    return null;
+  }
+
+  return {
+    walls: wallRegions,
+    wallLines,
+    windows,
+    doors,
+    source: analysis.segmentation ? 'backend-cv-segmentation' : 'browser-heuristic',
+  };
+}
+
+function buildWallSegmentsFromAnalysis(segmentation, shell, scale) {
+  const shellSegments = [
+    { x1: shell.shellX, y1: shell.shellY, x2: shell.shellX + shell.shellWidth, y2: shell.shellY, type: 'load-bearing', thickness: 0.32 },
+    { x1: shell.shellX + shell.shellWidth, y1: shell.shellY, x2: shell.shellX + shell.shellWidth, y2: shell.shellY + shell.shellHeight, type: 'load-bearing', thickness: 0.32 },
+    { x1: shell.shellX, y1: shell.shellY + shell.shellHeight, x2: shell.shellX + shell.shellWidth, y2: shell.shellY + shell.shellHeight, type: 'load-bearing', thickness: 0.32 },
+    { x1: shell.shellX, y1: shell.shellY, x2: shell.shellX, y2: shell.shellY + shell.shellHeight, type: 'load-bearing', thickness: 0.32 },
+  ];
+
+  if (!segmentation) {
+    return [];
+  }
+
+  const detectedSegments = [
+    ...segmentation.walls.map((rect) => rectToCenterline(rect, shell)),
+    ...segmentation.wallLines.map((line) => ({
+      ...line,
+      type: isBoundarySegment(line, shell) ? 'load-bearing' : 'partition',
+      thickness: isBoundarySegment(line, shell) ? 0.32 : 0.16,
+    })),
+  ].filter((segment) => segment && segmentLength(segment) * scale > 1.1);
+
+  const merged = mergeAxisAlignedSegments([...shellSegments, ...detectedSegments]);
+  return merged.length ? merged : shellSegments;
+}
+
+function buildOpeningsFromAnalysis(segmentation, shell, scale) {
+  if (!segmentation) return [];
+
+  const windows = segmentation.windows
+    .filter((rect) => rect.w >= 10 || rect.h >= 10)
+    .map((rect, index) => ({
+      id: `CW${index + 1}`,
+      type: 'window',
+      hostOrientation: rect.orientation,
+      x: rect.x + rect.w / 2,
+      y: rect.y + rect.h / 2,
+      width: Number((Math.max(rect.w, rect.h) * scale).toFixed(2)),
+      source: 'segmentation',
+    }));
+
+  const doors = [...segmentation.doors]
+    .sort((first, second) => (second.w * second.h) - (first.w * first.h))
+    .filter((rect) => rect.w >= 10 || rect.h >= 10)
+    .map((rect, index) => ({
+      id: `CD${index + 1}`,
+      type: isBoundaryRect(rect, shell) && index === 0 ? 'main-door' : 'door',
+      hostOrientation: rect.orientation,
+      x: rect.x + rect.w / 2,
+      y: rect.y + rect.h / 2,
+      width: Number((Math.max(rect.w, rect.h) * scale).toFixed(2)),
+      source: 'segmentation',
+    }));
+
+  return [...doors, ...windows];
+}
+
+function mapNormalizedRectToCanvas(rect, shell) {
+  return {
+    x: Math.round(shell.imageOffsetX + rect.x * shell.drawWidth),
+    y: Math.round(shell.imageOffsetY + rect.y * shell.drawHeight),
+    w: Math.max(2, Math.round(rect.w * shell.drawWidth)),
+    h: Math.max(2, Math.round(rect.h * shell.drawHeight)),
+  };
+}
+
+function mapNormalizedLineToCanvas(line, shell) {
+  return {
+    x1: Math.round(shell.imageOffsetX + line.x1 * shell.drawWidth),
+    y1: Math.round(shell.imageOffsetY + line.y1 * shell.drawHeight),
+    x2: Math.round(shell.imageOffsetX + line.x2 * shell.drawWidth),
+    y2: Math.round(shell.imageOffsetY + line.y2 * shell.drawHeight),
+  };
+}
+
+function snapLineToAxis(line) {
+  const dx = Math.abs(line.x2 - line.x1);
+  const dy = Math.abs(line.y2 - line.y1);
+  if (dx < 8 && dy < 8) return null;
+
+  if (dx >= dy * 1.5) {
+    const y = Math.round((line.y1 + line.y2) / 2);
+    return {
+      x1: Math.min(line.x1, line.x2),
+      y1: y,
+      x2: Math.max(line.x1, line.x2),
+      y2: y,
+    };
+  }
+
+  if (dy >= dx * 1.5) {
+    const x = Math.round((line.x1 + line.x2) / 2);
+    return {
+      x1: x,
+      y1: Math.min(line.y1, line.y2),
+      x2: x,
+      y2: Math.max(line.y1, line.y2),
+    };
+  }
+
+  return null;
+}
+
+function inferRectOrientation(rect) {
+  return rect.w >= rect.h ? 'horizontal' : 'vertical';
+}
+
+function rectToCenterline(rect, shell) {
+  const orientation = rect.orientation || inferRectOrientation(rect);
+  const isBoundary = isBoundaryRect(rect, shell);
+  if (orientation === 'vertical') {
+    const x = Math.round(rect.x + rect.w / 2);
+    return {
+      x1: x,
+      y1: rect.y,
+      x2: x,
+      y2: rect.y + rect.h,
+      type: isBoundary ? 'load-bearing' : 'partition',
+      thickness: isBoundary ? 0.32 : 0.16,
+    };
+  }
+
+  const y = Math.round(rect.y + rect.h / 2);
+  return {
+    x1: rect.x,
+    y1: y,
+    x2: rect.x + rect.w,
+    y2: y,
+    type: isBoundary ? 'load-bearing' : 'partition',
+    thickness: isBoundary ? 0.32 : 0.16,
+  };
+}
+
+function isBoundaryRect(rect, shell) {
+  const shellRight = shell.shellX + shell.shellWidth;
+  const shellBottom = shell.shellY + shell.shellHeight;
+  return (
+    Math.abs(rect.x - shell.shellX) < 18
+    || Math.abs(rect.y - shell.shellY) < 18
+    || Math.abs(rect.x + rect.w - shellRight) < 18
+    || Math.abs(rect.y + rect.h - shellBottom) < 18
+  );
+}
+
+function isBoundarySegment(segment, shell) {
+  const shellRight = shell.shellX + shell.shellWidth;
+  const shellBottom = shell.shellY + shell.shellHeight;
+  return (
+    Math.abs(segment.x1 - shell.shellX) < 18
+    || Math.abs(segment.x2 - shell.shellX) < 18
+    || Math.abs(segment.y1 - shell.shellY) < 18
+    || Math.abs(segment.y2 - shell.shellY) < 18
+    || Math.abs(segment.x1 - shellRight) < 18
+    || Math.abs(segment.x2 - shellRight) < 18
+    || Math.abs(segment.y1 - shellBottom) < 18
+    || Math.abs(segment.y2 - shellBottom) < 18
+  );
+}
+
+function mergeAxisAlignedSegments(segments) {
+  const byKey = new Map();
+
+  segments.forEach((segment) => {
+    const normalized = normalizeSegment({
+      ...segment,
+      x1: Math.round(segment.x1),
+      y1: Math.round(segment.y1),
+      x2: Math.round(segment.x2),
+      y2: Math.round(segment.y2),
+    });
+    const orientation = Math.abs(normalized.x2 - normalized.x1) >= Math.abs(normalized.y2 - normalized.y1) ? 'horizontal' : 'vertical';
+    const axis = orientation === 'horizontal' ? Math.round(normalized.y1 / 6) * 6 : Math.round(normalized.x1 / 6) * 6;
+    const start = orientation === 'horizontal' ? Math.min(normalized.x1, normalized.x2) : Math.min(normalized.y1, normalized.y2);
+    const end = orientation === 'horizontal' ? Math.max(normalized.x1, normalized.x2) : Math.max(normalized.y1, normalized.y2);
+    const type = normalized.type || 'partition';
+    const key = `${orientation}:${axis}:${type}`;
+    const bucket = byKey.get(key) || [];
+    bucket.push({ ...normalized, start, end, axis, orientation });
+    byKey.set(key, bucket);
+  });
+
+  const merged = [];
+  byKey.forEach((bucket) => {
+    bucket.sort((a, b) => a.start - b.start);
+    let current = null;
+
+    bucket.forEach((segment) => {
+      if (!current) {
+        current = { ...segment };
+        return;
+      }
+
+      if (segment.start <= current.end + 10) {
+        current.end = Math.max(current.end, segment.end);
+        current.thickness = Math.max(current.thickness || 0.16, segment.thickness || 0.16);
+        return;
+      }
+
+      merged.push(rehydrateMergedSegment(current));
+      current = { ...segment };
+    });
+
+    if (current) {
+      merged.push(rehydrateMergedSegment(current));
+    }
+  });
+
+  return merged;
+}
+
+function rehydrateMergedSegment(segment) {
+  if (segment.orientation === 'horizontal') {
+    return {
+      x1: segment.start,
+      y1: segment.axis,
+      x2: segment.end,
+      y2: segment.axis,
+      type: segment.type,
+      thickness: segment.thickness,
+    };
+  }
+
+  return {
+    x1: segment.axis,
+    y1: segment.start,
+    x2: segment.axis,
+    y2: segment.end,
+    type: segment.type,
+    thickness: segment.thickness,
+  };
+}
+
+function segmentLength(segment) {
+  return Math.hypot(segment.x2 - segment.x1, segment.y2 - segment.y1);
 }
 
 export function buildMaterialAnalysis(geometry) {

@@ -1,325 +1,197 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Play, RefreshCw, Sparkles } from 'lucide-react';
-import PipelineNav from './components/PipelineNav';
-import Sidebar from './components/Sidebar';
-import { formatDate } from './lib/format';
-import {
-  analyzeUploadedPlan,
-  STAGES,
-  PARSER_STEPS,
-  buildExplainabilityReport,
-  buildGeometryModel,
-  buildMaterialAnalysis,
-  buildModelStats,
-  buildParsedModel,
-  getPlanFromSelection,
-} from './lib/pipeline';
-import { useLocalStorageState } from './hooks/useLocalStorageState';
-import ParserSection from './sections/ParserSection';
-import GeometrySection from './sections/GeometrySection';
-import ModelSection from './sections/ModelSection';
-import MaterialsSection from './sections/MaterialsSection';
-import ReportSection from './sections/ReportSection';
+import { useEffect, useMemo, useState } from 'react';
+import UploadPanel from './components/UploadPanel';
+import PipelineViewer from './components/PipelineViewer';
+import ParsingCanvas from './components/ParsingCanvas';
+import GeometryViewer from './components/GeometryViewer';
+import ThreeStageViewer from './components/ThreeStageViewer';
+import MaterialPanel from './components/MaterialPanel';
+import ExplanationPanel from './components/ExplanationPanel';
+import { samplePlans } from './data/plans';
+import { fetchBackendHealth, runImagePipeline, runPlanPipeline } from './lib/api';
 
-const STORAGE_KEY = 'structure-ai-runs';
-const defaultLayers = { walls: true, rooms: true, openings: true, labels: true };
-const defaultModelControls = { autoRotate: true, wireframe: false, walls: true, slab: true, roof: false, explode: false };
-const idleProgress = { pct: 0, label: 'Idle' };
+const initialBackendStatus = {
+  ok: false,
+  error: '',
+  pipeline: { stages: [], samples: [] },
+};
 
 export default function App() {
-  const stageRefs = useRef([]);
-  const [selectedPlan, setSelectedPlan] = useState('B');
-  const [uploadedPlan, setUploadedPlan] = useState(null);
-  const [planDraft, setPlanDraft] = useState(() => clonePlan(getPlanFromSelection('B', null)));
-  const [activeRun, setActiveRun] = useState(null);
-  const [currentStage, setCurrentStage] = useState(0);
-  const [completedStage, setCompletedStage] = useState(0);
-  const [progress, setProgress] = useState(idleProgress);
-  const [isParsing, setIsParsing] = useState(false);
-  const [layers, setLayers] = useState(defaultLayers);
-  const [modelControls, setModelControls] = useState(defaultModelControls);
-  const [history, setHistory] = useLocalStorageState(STORAGE_KEY, []);
+  const [selectedPlanId, setSelectedPlanId] = useState('B');
+  const [uploadedFile, setUploadedFile] = useState(null);
+  const [uploadPreview, setUploadPreview] = useState('');
+  const [result, setResult] = useState(null);
+  const [isRunning, setIsRunning] = useState(false);
+  const [backendStatus, setBackendStatus] = useState(initialBackendStatus);
+  const [error, setError] = useState('');
 
-  const geometry = useMemo(() => (activeRun ? buildGeometryModel(activeRun.parsed) : null), [activeRun]);
-  const modelStats = useMemo(() => (geometry ? buildModelStats(geometry) : null), [geometry]);
-  const materialAnalysis = useMemo(() => (geometry ? buildMaterialAnalysis(geometry) : null), [geometry]);
-  const previewParsed = useMemo(() => (planDraft ? buildParsedModel(planDraft) : null), [planDraft]);
-  const report = useMemo(() => {
-    if (!activeRun || !geometry || !materialAnalysis) return [];
-    return buildExplainabilityReport(activeRun.plan, geometry, materialAnalysis);
-  }, [activeRun, geometry, materialAnalysis]);
+  const sampleOptions = useMemo(
+    () => Object.entries(samplePlans).map(([id, plan]) => ({ id, name: plan.name })),
+    [],
+  );
+
+  const stageOutputs = result?.stage_outputs || null;
+  const selectedPlan = samplePlans[selectedPlanId];
 
   useEffect(() => {
-    setPlanDraft(clonePlan(getPlanFromSelection(selectedPlan, uploadedPlan)));
-  }, [selectedPlan, uploadedPlan]);
+    let active = true;
 
-  const handleRunPipeline = async (planId = selectedPlan) => {
-    const plan = clonePlan(planDraft || getPlanFromSelection(planId, uploadedPlan));
-    const parsed = buildParsedModel(plan);
-
-    setIsParsing(true);
-    setCurrentStage(0);
-    setCompletedStage(0);
-
-    for (const step of PARSER_STEPS) {
-      setProgress(step);
-      await new Promise((resolve) => setTimeout(resolve, 320));
-    }
-
-    const nextRun = {
-      id: String(Date.now()),
-      plan,
-      parsed,
-      uploadedPlan,
+    const loadHealth = async () => {
+      const health = await fetchBackendHealth();
+      if (!active) return;
+      setBackendStatus(health);
     };
 
-    setActiveRun(nextRun);
-    setCompletedStage(4);
-    setCurrentStage(0);
-    setIsParsing(false);
-    setHistory((previousRuns) => [
-      {
-        id: nextRun.id,
-        planName: plan.name,
-        completedStage: 4,
-        timestamp: formatDate(),
-      },
-      ...previousRuns,
-    ].slice(0, 6));
-  };
+    loadHealth();
+    return () => {
+      active = false;
+    };
+  }, []);
 
-  const handleReset = () => {
-    setActiveRun(null);
-    setProgress(idleProgress);
-    setCurrentStage(0);
-    setCompletedStage(0);
-    setLayers(defaultLayers);
-    setModelControls(defaultModelControls);
-    setUploadedPlan(null);
-    setSelectedPlan('B');
-    setPlanDraft(clonePlan(getPlanFromSelection('B', null)));
-  };
+  useEffect(() => {
+    if (!uploadedFile) {
+      setUploadPreview('');
+      return undefined;
+    }
+
+    const nextUrl = URL.createObjectURL(uploadedFile);
+    setUploadPreview(nextUrl);
+    return () => {
+      URL.revokeObjectURL(nextUrl);
+    };
+  }, [uploadedFile]);
 
   const handleUpload = (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = () => {
-      const src = String(reader.result || '');
-      const image = new Image();
-      image.onload = async () => {
-        const nextUpload = {
-          src,
-          width: image.width,
-          height: image.height,
-          name: file.name,
-        };
-        const derivedPlan = await analyzeUploadedPlan(nextUpload);
-        setUploadedPlan({
-          ...nextUpload,
-          derivedPlan,
-        });
-        setSelectedPlan('CUSTOM');
-      };
-      image.src = src;
-    };
-    reader.readAsDataURL(file);
+    setResult(null);
+    setError('');
+    setUploadedFile(file);
   };
 
-  const handleExportReport = () => {
-    if (!activeRun || !materialAnalysis) return;
+  const handleClearUpload = () => {
+    setUploadedFile(null);
+    setResult(null);
+    setError('');
+  };
 
-    const lines = [
-      'STRUCTURE AI REPORT',
-      `Plan: ${activeRun.plan.name}`,
-      `Generated: ${formatDate()}`,
-      '',
-      ...report.flatMap((section) => [section.title, section.body, '']),
-      'Top Materials:',
-      ...materialAnalysis.topSelections.map((item) => `- ${item.section}: ${item.top.name} (score ${item.top.score})`),
-    ];
+  const handleRun = async () => {
+    setError('');
+    setIsRunning(true);
 
-    const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
-    const fileUrl = URL.createObjectURL(blob);
+    try {
+      const nextResult = uploadedFile
+        ? await runImagePipeline(uploadedFile)
+        : await runPlanPipeline(selectedPlan);
+      setResult(nextResult);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : 'Pipeline execution failed');
+    } finally {
+      setIsRunning(false);
+    }
+  };
+
+  const handleDownloadTrace = () => {
+    if (!result) return;
+    const blob = new Blob([JSON.stringify(result, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    link.href = fileUrl;
-    link.download = 'structure-ai-report.txt';
+    link.href = url;
+    link.download = 'autonomous-structural-trace.json';
     link.click();
-    URL.revokeObjectURL(fileUrl);
-  };
-
-  const goToStage = (stageIndex) => {
-    setCurrentStage(stageIndex);
-    stageRefs.current[stageIndex]?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  };
-
-  const setStageRef = (stageIndex) => (element) => {
-    stageRefs.current[stageIndex] = element;
-  };
-
-  const toggleLayer = (layerName) => {
-    setLayers((currentLayers) => ({
-      ...currentLayers,
-      [layerName]: !currentLayers[layerName],
-    }));
-  };
-
-  const toggleModelControl = (controlName) => {
-    setModelControls((currentControls) => ({
-      ...currentControls,
-      [controlName]: !currentControls[controlName],
-    }));
-  };
-
-  const updateShell = (field, value) => {
-    setPlanDraft((currentPlan) => {
-      if (!currentPlan?.outerWalls?.length) return currentPlan;
-      const numericValue = Number(value);
-      const nextPlan = clonePlan(currentPlan);
-      nextPlan.outerWalls[0][field] = Number.isFinite(numericValue) ? numericValue : nextPlan.outerWalls[0][field];
-      return nextPlan;
-    });
-  };
-
-  const updateShellRect = (nextShell) => {
-    setPlanDraft((currentPlan) => {
-      if (!currentPlan?.outerWalls?.length) return currentPlan;
-      const nextPlan = clonePlan(currentPlan);
-      nextPlan.outerWalls[0] = {
-        ...nextPlan.outerWalls[0],
-        ...nextShell,
-      };
-      return nextPlan;
-    });
-  };
-
-  const updateRoom = (index, field, value) => {
-    setPlanDraft((currentPlan) => {
-      if (!currentPlan?.rooms?.[index]) return currentPlan;
-      const nextPlan = clonePlan(currentPlan);
-      if (field === 'name') {
-        nextPlan.rooms[index][field] = value;
-      } else {
-        const numericValue = Number(value);
-        if (Number.isFinite(numericValue)) nextPlan.rooms[index][field] = numericValue;
-      }
-      return nextPlan;
-    });
-  };
-
-  const addRoom = () => {
-    setPlanDraft((currentPlan) => {
-      if (!currentPlan?.outerWalls?.length) return currentPlan;
-      const nextPlan = clonePlan(currentPlan);
-      const shell = nextPlan.outerWalls[0];
-      nextPlan.rooms.push({
-        name: `Room ${nextPlan.rooms.length + 1}`,
-        x: shell.x + 20,
-        y: shell.y + 20,
-        w: Math.max(72, Math.round(shell.w * 0.18)),
-        h: Math.max(64, Math.round(shell.h * 0.18)),
-        color: 'rgba(255,255,255,0.08)',
-      });
-      return nextPlan;
-    });
-  };
-
-  const removeRoom = (index) => {
-    setPlanDraft((currentPlan) => {
-      if (!currentPlan?.rooms?.[index]) return currentPlan;
-      const nextPlan = clonePlan(currentPlan);
-      nextPlan.rooms.splice(index, 1);
-      return nextPlan;
-    });
+    URL.revokeObjectURL(url);
   };
 
   return (
-    <div className="min-h-screen px-4 py-6 text-white md:px-6 xl:px-8">
-      <div className="mx-auto max-w-[1500px]">
-        <header className="rounded-[32px] border border-white/10 bg-panel/70 p-6 shadow-glow backdrop-blur">
-          <div className="flex flex-col gap-6 xl:flex-row xl:items-end xl:justify-between">
-            <div>
-              <div className="inline-flex items-center gap-2 rounded-full border border-lime/30 bg-lime/10 px-3 py-1 text-xs uppercase tracking-[0.28em] text-lime">
-                <Sparkles size={14} />
-                Structural Intelligence System
-              </div>
-              <h1 className="mt-4 max-w-4xl font-display text-4xl leading-tight text-white md:text-6xl">
-                Full 5-stage structural pipeline in React + Tailwind, built to feel like a real product.
-              </h1>
-              <p className="mt-4 max-w-3xl text-base text-fog md:text-lg">
-                This app turns a floor-plan concept into parsed geometry, structural reconstruction, a live 3D model, material recommendations, and an explainability report. The CV and LLM seams are already shaped for production backend integration.
-              </p>
-            </div>
+    <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(251,191,36,0.14),transparent_28%),radial-gradient(circle_at_bottom_right,_rgba(14,165,233,0.12),transparent_24%),linear-gradient(160deg,#020617_0%,#050b16_45%,#0f172a_100%)] px-4 py-5 text-white md:px-6 xl:px-8">
+      <div className="mx-auto max-w-[1500px] space-y-6">
+        <UploadPanel
+          sampleOptions={sampleOptions}
+          selectedPlanId={selectedPlanId}
+          onSelectPlan={setSelectedPlanId}
+          uploadedFile={uploadedFile}
+          uploadPreview={uploadPreview}
+          onUpload={handleUpload}
+          onClearUpload={handleClearUpload}
+          onRun={handleRun}
+          isRunning={isRunning}
+          backendStatus={backendStatus}
+        />
 
-            <div className="flex flex-wrap gap-3">
-              <button type="button" onClick={() => handleRunPipeline(selectedPlan)} className="inline-flex items-center gap-2 rounded-full bg-lime px-5 py-3 font-semibold text-ink transition hover:scale-[1.01]">
-                <Play size={18} />
-                Run Full Pipeline
-              </button>
-              <button type="button" onClick={handleReset} className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/5 px-5 py-3 font-semibold text-white transition hover:bg-white/10">
-                <RefreshCw size={18} />
-                Reset
-              </button>
-            </div>
+        {error ? (
+          <div className="rounded-[24px] border border-rose-400/25 bg-rose-400/10 px-5 py-4 text-sm leading-7 text-rose-100">
+            {error}
           </div>
-        </header>
+        ) : null}
 
-        <div className="mt-6 grid gap-6 xl:grid-cols-[minmax(0,1fr)_360px]">
-          <main className="space-y-6">
-            <PipelineNav stages={STAGES} currentStage={currentStage} completedStage={completedStage} onSelect={goToStage} />
+        <PipelineViewer result={result} onDownloadTrace={handleDownloadTrace} />
 
-            <section ref={setStageRef(0)} className="scroll-mt-6">
-              <ParserSection
-                selectedPlan={selectedPlan}
-                onSelectPlan={setSelectedPlan}
-                onStart={() => handleRunPipeline(selectedPlan)}
-                onUpload={handleUpload}
-                uploadedPlan={uploadedPlan}
-                progress={progress}
-                isParsing={isParsing}
-                layers={layers}
-                onToggleLayer={toggleLayer}
-                parsed={previewParsed || activeRun?.parsed}
-                planPreview={uploadedPlan?.src || activeRun?.plan.preview}
-                planDraft={planDraft}
-                onUpdateShell={updateShell}
-                onUpdateShellRect={updateShellRect}
-                onUpdateRoom={updateRoom}
-                onAddRoom={addRoom}
-                onRemoveRoom={removeRoom}
-              />
-            </section>
+        <div className="grid gap-6 xl:grid-cols-2">
+          <StageSection
+            eyebrow="Stage 1"
+            title="Parsing Contract"
+            description={stageOutputs?.parsing
+              ? `${stageOutputs.parsing.walls.length} walls, ${stageOutputs.parsing.openings.length} openings, confidence ${stageOutputs.parsing.confidence.toFixed(2)}`
+              : 'Structured parser output only. Later stages never read the raw image.'}
+          >
+            <ParsingCanvas parsing={stageOutputs?.parsing} />
+          </StageSection>
 
-            <section ref={setStageRef(1)} className="scroll-mt-6">
-              <GeometrySection geometry={geometry} />
-            </section>
+          <StageSection
+            eyebrow="Stage 2"
+            title="Geometry + Structural Reasoning"
+            description={stageOutputs?.geometry
+              ? `${stageOutputs.geometry.nodes.length} nodes, ${stageOutputs.geometry.edges.length} edges, ${stageOutputs.geometry.rooms.length} rooms, ${stageOutputs.geometry.openings?.length || 0} openings`
+              : 'Validation snaps points, repairs near misses, and reconstructs a topological graph.'}
+          >
+            <GeometryViewer geometry={stageOutputs?.geometry} />
+          </StageSection>
+        </div>
 
-            <section ref={setStageRef(2)} className="scroll-mt-6">
-              <ModelSection
-                controls={modelControls}
-                onToggleControl={toggleModelControl}
-                geometry={geometry}
-                modelStats={modelStats}
-              />
-            </section>
+        <div className="grid gap-6 xl:grid-cols-[1.05fr_0.95fr]">
+          <StageSection
+            eyebrow="Stage 3"
+            title="3D Output"
+            description={stageOutputs?.model3d
+              ? `${stageOutputs.model3d.elements.length} 3D elements including ${stageOutputs.model3d.elements.filter((item) => item.type === 'door').length} doors and ${stageOutputs.model3d.elements.filter((item) => item.type === 'window').length} windows`
+              : '3D generation consumes only the geometry contract and emits wall/floor element payloads.'}
+          >
+            <ThreeStageViewer model3d={stageOutputs?.model3d} />
+          </StageSection>
 
-            <section ref={setStageRef(3)} className="scroll-mt-6">
-              <MaterialsSection materialAnalysis={materialAnalysis} />
-            </section>
+          <div className="space-y-6">
+            <StageSection
+              eyebrow="Stage 4"
+              title="Material Reasoning"
+              description={stageOutputs?.materials
+                ? `${stageOutputs.materials.results.length} element-level material decisions`
+                : 'Load-bearing walls prioritize strength; partitions prioritize cost.'}
+            >
+              <MaterialPanel materials={stageOutputs?.materials} />
+            </StageSection>
 
-            <section ref={setStageRef(4)} className="scroll-mt-6">
-              <ReportSection report={report} onExport={handleExportReport} />
-            </section>
-          </main>
-
-          <Sidebar run={activeRun} geometry={geometry} materialAnalysis={materialAnalysis} history={history} />
+            <StageSection
+              eyebrow="Stage 5"
+              title="Explainability"
+              description={stageOutputs?.explainability
+                ? `${stageOutputs.explainability.results.length} explanations referencing wall type and span`
+                : 'Every recommendation is explained in structural terms, not only scores.'}
+            >
+              <ExplanationPanel explainability={stageOutputs?.explainability} />
+            </StageSection>
+          </div>
         </div>
       </div>
     </div>
   );
 }
 
-function clonePlan(plan) {
-  return plan ? JSON.parse(JSON.stringify(plan)) : null;
+function StageSection({ eyebrow, title, description, children }) {
+  return (
+    <section className="rounded-[30px] border border-white/10 bg-slate-950/70 p-6 shadow-[0_18px_60px_rgba(0,0,0,0.2)] backdrop-blur">
+      <p className="text-xs font-semibold uppercase tracking-[0.32em] text-amber-300">{eyebrow}</p>
+      <h2 className="mt-3 text-2xl font-semibold text-white">{title}</h2>
+      <p className="mt-3 text-sm leading-7 text-slate-300">{description}</p>
+      <div className="mt-5">{children}</div>
+    </section>
+  );
 }
